@@ -325,6 +325,21 @@ ZoneExtent* ZoneFile::GetExtent(uint64_t file_offset, uint64_t* dev_offset) {
   return NULL;
 }
 
+IOStatus ZoneFile::InvalidateCache() {
+  ReadLock lck(this);
+  int f = zbd_->GetReadFD();
+
+  for (uint32_t i = 0; i < extents_.size(); i++) {
+    int ret = posix_fadvise(f, extents_[i]->start_, extents_[i]->length_,
+                            POSIX_FADV_DONTNEED);
+    if (ret) {
+      return IOStatus::IOError("Fadvice error while invalidating");
+    }
+  }
+
+  return IOStatus::OK();
+}
+
 IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
                                   char* scratch, bool direct) {
   ZenFSMetricsLatencyGuard guard(zbd_->GetMetrics(), ZENFS_READ_LATENCY,

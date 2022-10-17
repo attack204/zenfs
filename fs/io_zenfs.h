@@ -150,6 +150,8 @@ class ZoneFile {
   uint32_t GetNrLinks() { return linkfiles_.size(); }
   const std::vector<std::string>& GetLinkFiles() const { return linkfiles_; }
 
+  IOStatus InvalidateCache();
+
  private:
   void ReleaseActiveZone();
   void SetActiveZone(Zone* zone);
@@ -283,7 +285,7 @@ class ZonedSequentialFile : public FSSequentialFile {
   }
 
   IOStatus InvalidateCache(size_t /*offset*/, size_t /*length*/) override {
-    return IOStatus::OK();
+    return zoneFile_->InvalidateCache();
   }
 };
 
@@ -315,7 +317,7 @@ class ZonedRandomAccessFile : public FSRandomAccessFile {
   }
 
   IOStatus InvalidateCache(size_t /*offset*/, size_t /*length*/) override {
-    return IOStatus::OK();
+    return zoneFile_->InvalidateCache();
   }
 };
 
