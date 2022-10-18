@@ -6,49 +6,72 @@
 
 #pragma once
 
+#if __cplusplus < 201703L
+#include "filesystem_utility.h"
+namespace fs = filesystem_utility;
+#else
+#include <filesystem>
+namespace fs = std::filesystem;
+#endif
+
+#include <memory>
+#include <thread>
+
 #include "io_zenfs.h"
+#include "metrics.h"
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/status.h"
+#include "snapshot.h"
+#include "version.h"
 #include "zbd_zenfs.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 #if !defined(ROCKSDB_LITE) && defined(OS_LINUX)
 
+class ZoneSnapshot;
+class ZoneFileSnapshot;
+class ZenFSSnapshot;
+class ZenFSSnapshotOptions;
+
 class Superblock {
   uint32_t magic_ = 0;
   char uuid_[37] = {0};
   uint32_t sequence_ = 0;
-  uint32_t version_ = 0;
+  uint32_t superblock_version_ = 0;
   uint32_t flags_ = 0;
   uint32_t block_size_ = 0; /* in bytes */
   uint32_t zone_size_ = 0;  /* in blocks */
   uint32_t nr_zones_ = 0;
   char aux_fs_path_[256] = {0};
   uint32_t finish_treshold_ = 0;
-  char reserved_[187] = {0};
+  char zenfs_version_[64]{0};
+  char reserved_[123] = {0};
 
  public:
   const uint32_t MAGIC = 0x5a454e46; /* ZENF */
   const uint32_t ENCODED_SIZE = 512;
-  const uint32_t CURRENT_VERSION = 1;
+  const uint32_t CURRENT_SUPERBLOCK_VERSION = 2;
   const uint32_t DEFAULT_FLAGS = 0;
+  const uint32_t FLAGS_ENABLE_GC = 1 << 0;
 
   Superblock() {}
 
   /* Create a superblock for a filesystem covering the entire zoned block device
    */
   Superblock(ZonedBlockDevice* zbd, std::string aux_fs_path = "",
-             uint32_t finish_threshold = 0) {
+             uint32_t finish_threshold = 0, bool enable_gc = false) {
     std::string uuid = Env::Default()->GenerateUniqueId();
     int uuid_len =
         std::min(uuid.length(),
                  sizeof(uuid_) - 1); /* make sure uuid is nullterminated */
     memcpy((void*)uuid_, uuid.c_str(), uuid_len);
     magic_ = MAGIC;
-    version_ = CURRENT_VERSION;
+    superblock_version_ = CURRENT_SUPERBLOCK_VERSION;
     flags_ = DEFAULT_FLAGS;
+    if (enable_gc) flags_ |= FLAGS_ENABLE_GC;
+
     finish_treshold_ = finish_threshold;
 
     block_size_ = zbd->GetBlockSize();
@@ -56,16 +79,22 @@ class Superblock {
     nr_zones_ = zbd->GetNrZones();
 
     strncpy(aux_fs_path_, aux_fs_path.c_str(), sizeof(aux_fs_path_) - 1);
+
+    std::string zenfs_version = ZENFS_VERSION;
+    strncpy(zenfs_version_, zenfs_version.c_str(), sizeof(zenfs_version_) - 1);
   }
 
   Status DecodeFrom(Slice* input);
   void EncodeTo(std::string* output);
   Status CompatibleWith(ZonedBlockDevice* zbd);
 
+  void GetReport(std::string* reportString);
+
   uint32_t GetSeq() { return sequence_; }
   std::string GetAuxFsPath() { return std::string(aux_fs_path_); }
   uint32_t GetFinishTreshold() { return finish_treshold_; }
   std::string GetUUID() { return std::string(uuid_); }
+  bool IsGCEnabled() { return flags_ & FLAGS_ENABLE_GC; };
 };
 
 class ZenMetaLog {
@@ -80,14 +109,19 @@ class ZenMetaLog {
 
  public:
   ZenMetaLog(ZonedBlockDevice* zbd, Zone* zone) {
+    assert(zone->IsBusy());
     zbd_ = zbd;
     zone_ = zone;
-    zone_->open_for_write_ = true;
     bs_ = zbd_->GetBlockSize();
     read_pos_ = zone->start_;
   }
 
-  virtual ~ZenMetaLog() { zone_->open_for_write_ = false; }
+  virtual ~ZenMetaLog() {
+    // TODO: report async error status
+    bool ok = zone_->Release();
+    assert(ok);
+    (void)ok;
+  }
 
   IOStatus AddRecord(const Slice& slice);
   IOStatus ReadRecord(Slice* record, std::string* scratch);
@@ -100,7 +134,7 @@ class ZenMetaLog {
 
 class ZenFS : public FileSystemWrapper {
   ZonedBlockDevice* zbd_;
-  std::map<std::string, ZoneFile*> files_;
+  std::map<std::string, std::shared_ptr<ZoneFile>> files_;
   std::mutex files_mtx_;
   std::shared_ptr<Logger> logger_;
   std::atomic<uint64_t> next_file_id_;
@@ -112,7 +146,10 @@ class ZenFS : public FileSystemWrapper {
 
   std::shared_ptr<Logger> GetLogger() { return logger_; }
 
-  struct MetadataWriter : public ZonedWritableFile::MetadataWriter {
+  std::unique_ptr<std::thread> gc_worker_ = nullptr;
+  bool run_gc_worker_ = false;
+
+  struct ZenFSMetadataWriter : public MetadataWriter {
     ZenFS* zenFS;
     IOStatus Persist(ZoneFile* zoneFile) {
       Debug(zenFS->GetLogger(), "Syncing metadata for: %s",
@@ -121,29 +158,45 @@ class ZenFS : public FileSystemWrapper {
     }
   };
 
-  MetadataWriter metadata_writer_;
+  ZenFSMetadataWriter metadata_writer_;
 
   enum ZenFSTag : uint32_t {
     kCompleteFilesSnapshot = 1,
     kFileUpdate = 2,
     kFileDeletion = 3,
     kEndRecord = 4,
+    kFileReplace = 5,
   };
 
   void LogFiles();
   void ClearFiles();
+  std::string FormatPathLexically(fs::path filepath);
   IOStatus WriteSnapshotLocked(ZenMetaLog* meta_log);
   IOStatus WriteEndRecord(ZenMetaLog* meta_log);
   IOStatus RollMetaZoneLocked();
   IOStatus PersistSnapshot(ZenMetaLog* meta_writer);
   IOStatus PersistRecord(std::string record);
-  IOStatus SyncFileMetadata(ZoneFile* zoneFile);
+  IOStatus SyncFileExtents(ZoneFile* zoneFile,
+                           std::vector<ZoneExtent*> new_extents);
+  /* Must hold files_mtx_ */
+  IOStatus SyncFileMetadataNoLock(ZoneFile* zoneFile, bool replace = false);
+  /* Must hold files_mtx_ */
+  IOStatus SyncFileMetadataNoLock(std::shared_ptr<ZoneFile> zoneFile,
+                                  bool replace = false) {
+    return SyncFileMetadataNoLock(zoneFile.get(), replace);
+  }
+  IOStatus SyncFileMetadata(ZoneFile* zoneFile, bool replace = false);
+  IOStatus SyncFileMetadata(std::shared_ptr<ZoneFile> zoneFile,
+                            bool replace = false) {
+    return SyncFileMetadata(zoneFile.get(), replace);
+  }
 
   void EncodeSnapshotTo(std::string* output);
-  void EncodeFileDeletionTo(ZoneFile* zoneFile, std::string* output);
+  void EncodeFileDeletionTo(std::shared_ptr<ZoneFile> zoneFile,
+                            std::string* output, std::string linkf);
 
   Status DecodeSnapshotFrom(Slice* input);
-  Status DecodeFileUpdateFrom(Slice* slice);
+  Status DecodeFileUpdateFrom(Slice* slice, bool replace = false);
   Status DecodeFileDeletionFrom(Slice* slice);
 
   Status RecoverFrom(ZenMetaLog* log);
@@ -158,9 +211,67 @@ class ZenFS : public FileSystemWrapper {
     return path;
   }
 
-  ZoneFile* GetFileInternal(std::string fname);
-  ZoneFile* GetFile(std::string fname);
-  IOStatus DeleteFile(std::string fname);
+  /* Must hold files_mtx_ */
+  std::shared_ptr<ZoneFile> GetFileNoLock(std::string fname);
+  /* Must hold files_mtx_ */
+  void GetZenFSChildrenNoLock(const std::string& dir,
+                              bool include_grandchildren,
+                              std::vector<std::string>* result);
+  /* Must hold files_mtx_ */
+  IOStatus GetChildrenNoLock(const std::string& dir, const IOOptions& options,
+                             std::vector<std::string>* result,
+                             IODebugContext* dbg);
+
+  /* Must hold files_mtx_ */
+  IOStatus RenameChildNoLock(std::string const& source_dir,
+                             std::string const& dest_dir,
+                             std::string const& child, const IOOptions& options,
+                             IODebugContext* dbg);
+
+  /* Must hold files_mtx_ */
+  IOStatus RollbackAuxDirRenameNoLock(
+      const std::string& source_path, const std::string& dest_path,
+      const std::vector<std::string>& renamed_children,
+      const IOOptions& options, IODebugContext* dbg);
+
+  /* Must hold files_mtx_ */
+  IOStatus RenameAuxPathNoLock(const std::string& source_path,
+                               const std::string& dest_path,
+                               const IOOptions& options, IODebugContext* dbg);
+
+  /* Must hold files_mtx_ */
+  IOStatus RenameFileNoLock(const std::string& f, const std::string& t,
+                            const IOOptions& options, IODebugContext* dbg);
+
+  std::shared_ptr<ZoneFile> GetFile(std::string fname);
+
+  /* Must hold files_mtx_, On successful return,
+   * caller must release files_mtx_ and call ResetUnusedIOZones() */
+  IOStatus DeleteFileNoLock(std::string fname, const IOOptions& options,
+                            IODebugContext* dbg);
+
+  IOStatus Repair();
+
+  /* Must hold files_mtx_ */
+  IOStatus DeleteDirRecursiveNoLock(const std::string& d,
+                                    const IOOptions& options,
+                                    IODebugContext* dbg);
+
+  /* Must hold files_mtx_ */
+  IOStatus IsDirectoryNoLock(const std::string& path, const IOOptions& options,
+                             bool* is_dir, IODebugContext* dbg) {
+    if (GetFileNoLock(path) != nullptr) {
+      *is_dir = false;
+      return IOStatus::OK();
+    }
+    return target()->IsDirectory(ToAuxPath(path), options, is_dir, dbg);
+  }
+
+ protected:
+  IOStatus OpenWritableFile(const std::string& fname,
+                            const FileOptions& file_opts,
+                            std::unique_ptr<FSWritableFile>* result,
+                            IODebugContext* dbg, bool reopen);
 
  public:
   explicit ZenFS(ZonedBlockDevice* zbd, std::shared_ptr<FileSystem> aux_fs,
@@ -168,7 +279,8 @@ class ZenFS : public FileSystemWrapper {
   virtual ~ZenFS();
 
   Status Mount(bool readonly);
-  Status MkFS(std::string aux_fs_path, uint32_t finish_threshold);
+  Status MkFS(std::string aux_fs_path, uint32_t finish_threshold,
+              bool enable_gc);
   std::map<std::string, Env::WriteLifeTimeHint> GetWriteLifeTimeHints();
 
   const char* Name() const override {
@@ -176,6 +288,8 @@ class ZenFS : public FileSystemWrapper {
   }
 
   void EncodeJson(std::ostream& json_stream);
+
+  void ReportSuperblock(std::string* report) { superblock_->GetReport(report); }
 
   virtual IOStatus NewSequentialFile(const std::string& fname,
                                      const FileOptions& file_opts,
@@ -207,6 +321,17 @@ class ZenFS : public FileSystemWrapper {
   virtual IOStatus DeleteFile(const std::string& fname,
                               const IOOptions& options,
                               IODebugContext* dbg) override;
+  virtual IOStatus LinkFile(const std::string& fname, const std::string& lname,
+                            const IOOptions& options,
+                            IODebugContext* dbg) override;
+  virtual IOStatus NumFileLinks(const std::string& fname,
+                                const IOOptions& options, uint64_t* nr_links,
+                                IODebugContext* dbg) override;
+  virtual IOStatus AreFilesSame(const std::string& fname,
+                                const std::string& link,
+                                const IOOptions& options, bool* res,
+                                IODebugContext* dbg) override;
+
   IOStatus GetFileSize(const std::string& f, const IOOptions& options,
                        uint64_t* size, IODebugContext* dbg) override;
   IOStatus RenameFile(const std::string& f, const std::string& t,
@@ -227,11 +352,8 @@ class ZenFS : public FileSystemWrapper {
 
   IOStatus IsDirectory(const std::string& path, const IOOptions& options,
                        bool* is_dir, IODebugContext* dbg) override {
-    if (GetFile(path) != nullptr) {
-      *is_dir = false;
-      return IOStatus::OK();
-    }
-    return target()->IsDirectory(ToAuxPath(path), options, is_dir, dbg);
+    std::lock_guard<std::mutex> lock(files_mtx_);
+    return IsDirectoryNoLock(path, options, is_dir, dbg);
   }
 
   IOStatus NewDirectory(const std::string& name, const IOOptions& io_opts,
@@ -269,6 +391,9 @@ class ZenFS : public FileSystemWrapper {
 
     return target()->DeleteDir(ToAuxPath(d), options, dbg);
   }
+
+  IOStatus DeleteDirRecursive(const std::string& d, const IOOptions& options,
+                              IODebugContext* dbg);
 
   // We might want to override these in the future
   IOStatus GetAbsolutePath(const std::string& db_path, const IOOptions& options,
@@ -323,31 +448,34 @@ class ZenFS : public FileSystemWrapper {
         "MemoryMappedFileBuffer is not implemented in ZenFS");
   }
 
-  virtual IOStatus LinkFile(const std::string& /*src*/,
-                            const std::string& /*target*/,
-                            const IOOptions& /*options*/,
-                            IODebugContext* /*dbg*/) override {
-    return IOStatus::NotSupported("LinkFile is not supported in ZenFS");
-  }
+  void GetZenFSSnapshot(ZenFSSnapshot& snapshot,
+                        const ZenFSSnapshotOptions& options);
 
-  virtual IOStatus NumFileLinks(const std::string& /*fname*/,
-                                const IOOptions& /*options*/,
-                                uint64_t* /*count*/,
-                                IODebugContext* /*dbg*/) override {
-    return IOStatus::NotSupported(
-        "Getting number of file links is not supported in ZenFS");
-  }
+  IOStatus MigrateExtents(const std::vector<ZoneExtentSnapshot*>& extents);
 
-  virtual IOStatus AreFilesSame(const std::string& /*first*/,
-                                const std::string& /*second*/,
-                                const IOOptions& /*options*/, bool* /*res*/,
-                                IODebugContext* /*dbg*/) override {
-    return IOStatus::NotSupported("AreFilesSame is not supported in ZenFS");
-  }
+  IOStatus MigrateFileExtents(
+      const std::string& fname,
+      const std::vector<ZoneExtentSnapshot*>& migrate_exts);
+
+ private:
+  const uint64_t GC_START_LEVEL =
+      20;                      /* Enable GC when < 20% free space available */
+  const uint64_t GC_SLOPE = 3; /* GC agressiveness */
+  void GCWorker();
 };
 #endif  // !defined(ROCKSDB_LITE) && defined(OS_LINUX)
 
-Status NewZenFS(FileSystem** fs, const std::string& bdevname);
-std::map<std::string, std::string> ListZenFileSystems();
+Status NewZenFS(
+    FileSystem** fs, const std::string& bdevname,
+    std::shared_ptr<ZenFSMetrics> metrics = std::make_shared<NoZenFSMetrics>());
+Status NewZenFS(
+    FileSystem** fs, const ZbdBackendType backend_type,
+    const std::string& backend_name,
+    std::shared_ptr<ZenFSMetrics> metrics = std::make_shared<NoZenFSMetrics>());
+Status AppendZenFileSystem(
+    std::string path, ZbdBackendType backend,
+    std::map<std::string, std::pair<std::string, ZbdBackendType>>& fs_list);
+Status ListZenFileSystems(
+    std::map<std::string, std::pair<std::string, ZbdBackendType>>& out_list);
 
 }  // namespace ROCKSDB_NAMESPACE
